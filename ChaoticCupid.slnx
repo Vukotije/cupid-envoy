@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ChaoticCupid.Client/ChaoticCupid.Client.csproj" />
+    <Project Path="src/ChaoticCupid.Server/ChaoticCupid.Server.csproj" />
+    <Project Path="src/ChaoticCupid.Shared/ChaoticCupid.Shared.csproj" />
+  </Folder>
+</Solution>
