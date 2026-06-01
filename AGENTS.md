@@ -7,29 +7,42 @@ Read `SPECIFICATION.md` first for the full feature requirements before making an
 
 ## Project Context
 
-This is a **.NET PubSub application** (WCF or ASP.NET Core) implementing a matchmaking simulation.
+This is a **.NET 10 PubSub application** implementing a matchmaking simulation, built with
+**ASP.NET Core + SignalR** (chosen over WCF, whose server side is not supported on modern
+.NET / macOS).
 It has two distinct interfaces (`IPersonService`, `ICupidService`) and a console client for user interaction.
+
+The solution (`ChaoticCupid.slnx`) has three projects:
+
+- `src/ChaoticCupid.Shared` — DTOs shared by client and server.
+- `src/ChaoticCupid.Server` — SignalR hub (`CupidHub`) + Cupid background dispatcher (`CupidService`).
+- `src/ChaoticCupid.Client` — console client (the subscriber).
 
 ---
 
 ## Architecture Rules
 
-- **Two service interfaces** must remain separate: `IPersonService` and `ICupidService`.
-- Use a **PubSub pattern**: Cupid publishes letters; registered persons are subscribers.
-- All **shared state** (registered persons, block lists, pending acknowledgment flags) must be managed in a **thread-safe** manner (use `ConcurrentDictionary`, locks, or similar).
+- **Two service interfaces** must remain separate: `IPersonService` (implemented by `CupidHub`) and `ICupidService` (implemented by `CupidService`).
+- Use a **PubSub pattern**: Cupid publishes letters via SignalR (`IHubContext<CupidHub, ILetterClient>`); registered persons are subscribers that receive `ILetterClient.ReceiveLetter`.
+- All **shared state** lives in the thread-safe `PersonRegistry` singleton (`ConcurrentDictionary` + per-person locks / interlocked flags in `RegisteredPerson`).
 - The scoring and letter-dispatch logic belongs exclusively in the **Cupid service**, not in person-side code.
 
 ---
 
 ## Naming Conventions
 
-| Concept | Name |
+| Concept | Name (as implemented) |
 |---------|------|
 | Person registration method | `InitSinglePerson` |
-| Person data model | `PersonInfo` (or `Person`) |
-| Cupid scheduling logic | `CupidService` |
-| Letter dispatch method | `SendLetter` (or `DispatchLetters`) |
-| Block list per person | `BlockedUsers` (e.g., `HashSet<string>` per username) |
+| Person data model | `PersonInfo` (plain DTO in `ChaoticCupid.Shared`) |
+| Letter payload model | `LoveLetter` (DTO; `SenderPhone` is nullable so it can be omitted) |
+| Client callback contract | `ILetterClient.ReceiveLetter(LoveLetter)` |
+| Cupid scheduling logic | `CupidService` (a `BackgroundService` implementing `ICupidService`) |
+| Letter dispatch method | `DispatchLetters` |
+| Person hub | `CupidHub : Hub<ILetterClient>, IPersonService` |
+| Shared state store | `PersonRegistry` (singleton) |
+| Per-person state | `RegisteredPerson` (holds `PersonInfo`, connection id, pending-ack flag, blocked set) |
+| Block list per person | `HashSet<string>` (case-insensitive) inside `RegisteredPerson` |
 
 Follow existing naming if already established in the codebase — do not rename without a clear reason.
 
@@ -48,8 +61,8 @@ Follow existing naming if already established in the codebase — do not rename 
 
 ### Cupid Scheduling
 
-- Use a `System.Threading.Timer` or `Task.Delay` loop that fires **every 60 seconds**.
-- On each tick, iterate all registered persons and dispatch one letter per person.
+- Use a timer that fires **every 60 seconds** (implemented with `PeriodicTimer` inside `CupidService.ExecuteAsync`; interval is the constant `LetterIntervalSeconds`).
+- On each tick (`DispatchLetters`), iterate all registered persons and dispatch one letter per person.
 - Skip self-to-self letters (sender == recipient).
 - Skip letters to recipients who have a **pending unacknowledged letter**.
 - Skip letters from senders on the recipient's **block list**.
@@ -60,28 +73,27 @@ Compute a score for each candidate sender against a recipient:
 
 ```csharp
 int score = 0;
-if (candidate.City == recipient.City) score += 30;
+if (candidate.City == recipient.City) score += 30;            // case-insensitive compare
 if (Math.Abs(candidate.Age - recipient.Age) <= 2) score += 20;
-score += GetCryptoRandom(0, 101); // RNGCryptoServiceProvider, range [0, 100]
+score += CryptoRandom.GetInt32(0, 101);                       // cryptographic RNG, range [0, 100]
 ```
 
 Select the candidate with the **highest score**. In case of a tie, pick any.
 
-### Cryptographic Random (`RNGCryptoServiceProvider`)
+### Cryptographic Random (`CryptoRandom`)
 
-- **Always** use `System.Security.Cryptography.RNGCryptoServiceProvider` for the random factor.
+> **Deviation from the spec:** the original requirement names `RNGCryptoServiceProvider`,
+> but that type is obsolete (SYSLIB0023) since .NET 6. We use the supported cryptographic
+> RNG `System.Security.Cryptography.RandomNumberGenerator.GetInt32` instead. This still
+> satisfies the intent: a cryptographic RNG, **never** `System.Random`.
+
+- **Always** use the `CryptoRandom` helper (backed by `RandomNumberGenerator`) for the random factor.
 - Do **not** use `System.Random` anywhere in the scoring logic.
-- Encapsulate this in a helper method, e.g.:
+- The helper (`src/ChaoticCupid.Server/Helpers/CryptoRandom.cs`):
 
 ```csharp
-private static int GetCryptoRandom(int minInclusive, int maxExclusive)
-{
-    using var rng = new RNGCryptoServiceProvider();
-    byte[] bytes = new byte[4];
-    rng.GetBytes(bytes);
-    int value = Math.Abs(BitConverter.ToInt32(bytes, 0));
-    return minInclusive + (value % (maxExclusive - minInclusive));
-}
+public static int GetInt32(int minInclusive, int maxExclusive)
+    => RandomNumberGenerator.GetInt32(minInclusive, maxExclusive);
 ```
 
 ### Letter Delivery & Console Output
@@ -108,7 +120,7 @@ When a letter arrives, randomly select one of three messages:
 
 ## What NOT to Do
 
-- Do **not** use `System.Random` for the scoring random factor — it must be `RNGCryptoServiceProvider`.
+- Do **not** use `System.Random` for the scoring random factor — it must be a cryptographic RNG (`RandomNumberGenerator` via the `CryptoRandom` helper).
 - Do **not** allow a second letter to arrive before the first is acknowledged.
 - Do **not** expose phone numbers when the "not interested" message is selected.
 - Do **not** let a person receive a letter from themselves.
@@ -117,34 +129,43 @@ When a letter arrives, randomly select one of three messages:
 
 ---
 
-## File / Project Structure (Suggested)
+## File / Project Structure (as implemented)
 
 ```
+ChaoticCupid.slnx
 /src
-  /Contracts
-    IPersonService.cs       # Person-facing interface
-    ICupidService.cs        # Cupid-facing interface
-    PersonInfo.cs           # Data model
-    LoveLetter.cs           # Letter payload model
-  /Services
-    PersonService.cs        # IPersonService implementation
-    CupidService.cs         # Scoring + dispatch logic
-  /Helpers
-    CryptoRandom.cs         # RNGCryptoServiceProvider wrapper
-  /Client
+  /ChaoticCupid.Shared
+    PersonInfo.cs           # Data model (plain DTO)
+    LoveLetter.cs           # Letter payload model (nullable SenderPhone)
+    ILetterClient.cs        # Client callback contract (ReceiveLetter)
+  /ChaoticCupid.Server
+    Program.cs              # DI wiring, maps hub at /cupid
+    /Contracts
+      IPersonService.cs     # Person-facing interface (InitSinglePerson, AcknowledgeLetter, BlockUser)
+      ICupidService.cs      # Cupid-facing interface (DispatchLetters)
+    /Hubs
+      CupidHub.cs           # IPersonService implementation (SignalR hub)
+    /Services
+      CupidService.cs       # BackgroundService: scoring + dispatch logic
+    /State
+      PersonRegistry.cs     # Thread-safe store (singleton)
+      RegisteredPerson.cs   # Per-person state (connection, pending-ack, block list)
+    /Helpers
+      CryptoRandom.cs       # RandomNumberGenerator wrapper
+  /ChaoticCupid.Client
     Program.cs              # Console entry point, registration, command loop
 ```
 
-Adjust structure if the framework imposes a different layout, but keep concerns separated.
+Keep concerns separated if the structure changes.
 
 ---
 
 ## Testing Checklist (verify before marking a feature done)
 
 - [ ] Registration rejects empty input, non-numeric characters, and negative numbers.
-- [ ] Cupid timer fires every 60 seconds.
+- [ ] Cupid timer fires every 60 seconds (`PeriodicTimer`, `LetterIntervalSeconds`).
 - [ ] No person receives a letter from themselves.
-- [ ] Scoring uses `RNGCryptoServiceProvider` (not `System.Random`).
+- [ ] Scoring uses a cryptographic RNG (`RandomNumberGenerator` via `CryptoRandom`), not `System.Random`.
 - [ ] Same-city bonus (+30) and similar-age bonus (+20) are applied correctly.
 - [ ] Highest-scoring candidate is selected for letter dispatch.
 - [ ] Phone number is hidden when "not interested" message is selected.
